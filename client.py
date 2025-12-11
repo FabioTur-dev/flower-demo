@@ -1,16 +1,19 @@
+import argparse
 import flwr as fl
 import torch
-from model import LeNet5, load_mnist
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+from model import (
+    LeNet5_MNIST,
+    LeNet5_CIFAR,
+    load_mnist,
+    load_cifar10,
+    device,
+)
 
-model = LeNet5().to(device)
-trainloader, testloader = load_mnist()
-
-# -----------------------
-# Training
-# -----------------------
-def train_one_epoch():
+# -----------------------------------------------------------
+# Local Training
+# -----------------------------------------------------------
+def train_one_epoch(model, trainloader):
     model.train()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     loss_fn = torch.nn.CrossEntropyLoss()
@@ -22,13 +25,14 @@ def train_one_epoch():
         loss.backward()
         optimizer.step()
 
-# -----------------------
-# Evaluation
-# -----------------------
-def test():
+
+# -----------------------------------------------------------
+# Local Evaluation
+# -----------------------------------------------------------
+def evaluate_local(model, testloader):
     model.eval()
     loss_fn = torch.nn.CrossEntropyLoss()
-    loss_sum = 0
+    loss_sum = 0.0
     correct = 0
 
     with torch.no_grad():
@@ -40,41 +44,69 @@ def test():
 
     return loss_sum / len(testloader), correct / len(testloader.dataset)
 
-# -----------------------
+
+# -----------------------------------------------------------
 # Flower NumPyClient
-# -----------------------
-class Client(fl.client.NumPyClient):
+# -----------------------------------------------------------
+class FlowerClient(fl.client.NumPyClient):
+    def __init__(self, model, trainloader, testloader):
+        self.model = model
+        self.trainloader = trainloader
+        self.testloader = testloader
 
     def get_parameters(self, config):
-        return [p.detach().cpu().numpy() for p in model.parameters()]
+        # Restituisce i pesi locali
+        return [p.detach().cpu().numpy() for p in self.model.parameters()]
 
     def fit(self, parameters, config):
-        # Load new parameters
-        for p, new in zip(model.parameters(), parameters):
+        # Carica pesi globali
+        for p, new in zip(self.model.parameters(), parameters):
             p.data = torch.tensor(new, device=device)
 
-        # Local training
-        train_one_epoch()
+        # Allena 1 epoca
+        train_one_epoch(self.model, self.trainloader)
 
-        return self.get_parameters({}), len(trainloader.dataset), {}
+        # Ritorna pesi aggiornati
+        return self.get_parameters({}), len(self.trainloader.dataset), {}
 
     def evaluate(self, parameters, config):
-        # Load parameters
-        for p, new in zip(model.parameters(), parameters):
+        # Carica pesi globali
+        for p, new in zip(self.model.parameters(), parameters):
             p.data = torch.tensor(new, device=device)
 
-        loss, acc = test()
-        return float(loss), len(testloader.dataset), {"accuracy": float(acc)}
+        # Eval locale
+        loss, acc = evaluate_local(self.model, self.testloader)
+        return float(loss), len(self.testloader.dataset), {"accuracy": float(acc)}
 
 
-# -----------------------
-# Start client
-# -----------------------
+# -----------------------------------------------------------
+# Client Main
+# -----------------------------------------------------------
 from flwr.client import start_client
 
+SERVER_ADDR = "127.0.0.1:8099"
+
 if __name__ == "__main__":
+
+    print("========================================")
+    print("Connecting Flower Client to:", SERVER_ADDR)
+    print("========================================")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, choices=["mnist", "cifar10"], default="mnist")
+    args = parser.parse_args()
+
+    # Selezione dataset e modello
+    if args.dataset == "mnist":
+        model = LeNet5_MNIST().to(device)
+        trainloader, testloader = load_mnist()
+    else:
+        model = LeNet5_CIFAR().to(device)
+        trainloader, testloader = load_cifar10()
+
+    # Avvia client Flower
     start_client(
-        server_address="127.0.0.1:8080",   # IMPORTANT on Windows
-        client=Client().to_client(),
+        server_address=SERVER_ADDR,
+        client=FlowerClient(model, trainloader, testloader).to_client(),
     )
 
